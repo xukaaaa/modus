@@ -36,6 +36,7 @@ import type {
   ContextItem,
   ContextUsageInfo,
   FileDiff,
+  GitBranchSummary,
   ModelInfo,
   ModelSettingsState,
   PlanRef,
@@ -66,7 +67,6 @@ import type {
   ChatPaneHandle,
 } from "../features/agent/ChatPane";
 import { Composer, createEmptyComposerDraft } from "../features/composer/Composer";
-import { BranchSwitcher } from "../features/git/BranchSwitcher";
 import { INSPECTOR_MIN_WIDTH } from "../features/inspector/inspector-layout";
 import { cn } from "../lib/cn";
 import { useGitBranch } from "../lib/useGitBranch";
@@ -120,6 +120,8 @@ export function App() {
   // Composer mode for the hero (new-chat) screen — controlled so the "Plan New
   // Idea" pill can start a session straight in plan mode.
   const [heroMode, setHeroMode] = useState<AgentMode>("build");
+  const [heroScope, setHeroScope] = useState<"local" | "worktree">("local");
+  const [heroBaseBranch, setHeroBaseBranch] = useState<string | undefined>();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [model, setModel] = useState("");
   const [modelSettings, setModelSettings] = useState<ModelSettingsState | null>(null);
@@ -402,11 +404,16 @@ export function App() {
       return;
     }
     setActiveWorkspace(workspace);
+    setHeroScope("local");
+    setHeroBaseBranch(undefined);
     setWorkspaces(await window.modus.workspace.list());
     await refreshSessions();
   }
 
-  async function createSession(workspace: WorkspaceInfo | null): Promise<AgentSessionInfo | null> {
+  async function createSession(
+    workspace: WorkspaceInfo | null,
+    target: { scope: "local" | "worktree"; baseBranch?: string },
+  ): Promise<AgentSessionInfo | null> {
     if (!workspace) {
       return null;
     }
@@ -415,10 +422,16 @@ export function App() {
       setSessionCreateError("No model is configured. Connect a provider in Settings first.");
       return null;
     }
+    if (!target.baseBranch) {
+      setSessionCreateError("Select a branch before creating a chat.");
+      return null;
+    }
     try {
       const session = await window.modus.agent.create({
         workspaceId: workspace.id,
         cwd: workspace.rootPath,
+        draftScope: target.scope,
+        baseBranch: target.baseBranch,
         ...(model ? { model } : {}),
         title: "New chat",
       });
@@ -498,6 +511,8 @@ export function App() {
   function openNewChat(workspace?: WorkspaceInfo | null): void {
     if (workspace !== undefined) {
       setActiveWorkspace(workspace);
+      setHeroScope("local");
+      setHeroBaseBranch(undefined);
     }
     setSessionCreateError(undefined);
     setSettingsOpen(false);
@@ -539,8 +554,15 @@ export function App() {
     await refreshSessions();
   }
 
-  async function deleteSession(session: AgentSessionInfo): Promise<void> {
+  async function deleteSession(session: AgentSessionInfo, cleanupWorktree = false): Promise<void> {
     try {
+      if (cleanupWorktree && session.worktree) {
+        const workspace = workspaceById.get(session.workspaceId);
+        await window.modus.agent.cleanupSessionWorktree({
+          sessionId: session.id,
+          cwd: workspace?.rootPath ?? session.cwd,
+        });
+      }
       await window.modus.agent.delete(session.id);
     } catch (error) {
       setSessionCreateError(error instanceof Error ? error.message : String(error));
@@ -604,7 +626,8 @@ export function App() {
     if (!message.trim()) {
       return;
     }
-    const session = await createSession(activeWorkspace);
+    const target = { scope: heroScope, ...(heroBaseBranch ? { baseBranch: heroBaseBranch } : {}) };
+    const session = await createSession(activeWorkspace, target);
     if (!session) {
       return;
     }
@@ -803,7 +826,9 @@ export function App() {
                       agentSessions={rootSessions}
                       canCreateSession={canCreateSession}
                       onArchiveSession={(session) => void archiveSession(session)}
-                      onDeleteSession={(session) => void deleteSession(session)}
+                      onDeleteSession={(session, cleanupWorktree) =>
+                        void deleteSession(session, cleanupWorktree)
+                      }
                       onListArchivedSessions={(workspaceId) =>
                         window.modus.agent.listArchived(workspaceId)
                       }
@@ -936,9 +961,11 @@ export function App() {
                                 footer={
                                   <HeroEnvironmentTray
                                     activeWorkspace={activeWorkspace}
-                                    branch={branch}
-                                    cwd={activeCwd}
-                                    onError={setSessionCreateError}
+                                    cwd={activeWorkspace?.rootPath}
+                                    scope={heroScope}
+                                    baseBranch={heroBaseBranch}
+                                    onScopeChange={setHeroScope}
+                                    onBaseBranchChange={setHeroBaseBranch}
                                     onOpenFolder={() => void openWorkspace()}
                                     onSelectWorkspace={openNewChat}
                                     workspaces={workspaces}
@@ -1152,21 +1179,59 @@ const HERO_ENVIRONMENT_TRIGGER_CLASS =
 
 function HeroEnvironmentTray({
   activeWorkspace,
-  branch,
   cwd,
   workspaces,
+  scope,
+  baseBranch,
   onSelectWorkspace,
   onOpenFolder,
-  onError,
+  onScopeChange,
+  onBaseBranchChange,
 }: {
   activeWorkspace: WorkspaceInfo | null;
-  branch: string | undefined;
   cwd: string | undefined;
   workspaces: WorkspaceInfo[];
+  scope: "local" | "worktree";
+  baseBranch: string | undefined;
   onSelectWorkspace(workspace: WorkspaceInfo): void;
   onOpenFolder(): void;
-  onError(message: string): void;
+  onScopeChange(scope: "local" | "worktree"): void;
+  onBaseBranchChange(branch: string | undefined): void;
 }) {
+  const [branches, setBranches] = useState<GitBranchSummary>({ local: [], remote: [] });
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!cwd) {
+      setBranches({ local: [], remote: [] });
+      return undefined;
+    }
+    void window.modus.git
+      .branches(cwd)
+      .then((next: GitBranchSummary) => {
+        if (!cancelled) {
+          setBranches(next);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setBranches({ local: [], remote: [] });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cwd]);
+
+  const localBranches = branches.local;
+  const selectedBaseBranch = baseBranch ?? branches.current ?? localBranches[0]?.name;
+
+  useEffect(() => {
+    if (!baseBranch && selectedBaseBranch) {
+      onBaseBranchChange(selectedBaseBranch);
+    }
+  }, [baseBranch, onBaseBranchChange, selectedBaseBranch]);
+
   return (
     <div className="app-no-drag flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
       <WorkspaceMenu
@@ -1175,13 +1240,64 @@ function HeroEnvironmentTray({
         onSelect={onSelectWorkspace}
         workspaces={workspaces}
       />
-      <BranchSwitcher cwd={cwd} onError={onError} triggerClassName={HERO_ENVIRONMENT_TRIGGER_CLASS}>
-        <span className="toolbar-icon">
-          <IconGitBranch size={18} stroke={1.7} />
-        </span>
-        <span className="max-w-40 truncate">{branch ?? "No branch"}</span>
-        <IconChevronDown className="toolbar-icon" size={13} stroke={2} />
-      </BranchSwitcher>
+      <div className="flex items-center rounded-md bg-hover p-0.5 text-xs">
+        <button
+          className={cn(
+            "rounded px-2 py-1 transition-colors",
+            scope === "local" ? "bg-elevated text-fg shadow-sm" : "text-fg-muted hover:text-fg",
+          )}
+          onClick={() => onScopeChange("local")}
+          type="button"
+        >
+          Local
+        </button>
+        <button
+          className={cn(
+            "rounded px-2 py-1 transition-colors",
+            scope === "worktree" ? "bg-elevated text-fg shadow-sm" : "text-fg-muted hover:text-fg",
+          )}
+          disabled={localBranches.length === 0}
+          onClick={() => onScopeChange("worktree")}
+          type="button"
+        >
+          Worktree
+        </button>
+      </div>
+      <Menu.Root>
+        <Menu.Trigger
+          className={HERO_ENVIRONMENT_TRIGGER_CLASS}
+          disabled={localBranches.length === 0}
+        >
+          <span className="toolbar-icon">
+            <IconGitBranch size={18} stroke={1.7} />
+          </span>
+          <span className="max-w-40 truncate">{selectedBaseBranch ?? "Select branch"}</span>
+          <IconChevronDown className="toolbar-icon" size={13} stroke={2} />
+        </Menu.Trigger>
+        <Menu.Portal>
+          <Menu.Positioner align="start" side="bottom" sideOffset={6}>
+            <Menu.Popup className="scroll-thin origin-(--transform-origin) max-h-[360px] min-w-[260px] overflow-y-auto rounded-lg border border-hairline bg-elevated p-1 shadow-popup">
+              {localBranches.map((item) => (
+                <Menu.Item
+                  className="flex cursor-default items-center gap-2 rounded-md px-2.5 py-1.5 text-fg text-sm outline-none transition-colors select-none data-highlighted:bg-hover"
+                  closeOnClick
+                  key={item.name}
+                  onClick={() => onBaseBranchChange(item.name)}
+                >
+                  <span className="flex size-4 shrink-0 items-center justify-center text-accent">
+                    {item.name === selectedBaseBranch ? <IconCheck size={14} stroke={2} /> : null}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate">{item.name}</span>
+                  {item.current ? <span className="text-fg-faint text-xs">current</span> : null}
+                  {item.worktreePath ? (
+                    <span className="text-fg-faint text-xs">worktree</span>
+                  ) : null}
+                </Menu.Item>
+              ))}
+            </Menu.Popup>
+          </Menu.Positioner>
+        </Menu.Portal>
+      </Menu.Root>
     </div>
   );
 }

@@ -22,6 +22,7 @@ export type CreateAgentRuntimeInput = {
   subagentTask?: string;
   subagentType?: string;
   subagentReadOnly?: boolean;
+  worktree?: AgentSessionInfo["worktree"];
   subagentWorktree?: AgentSessionInfo["subagentWorktree"];
 };
 

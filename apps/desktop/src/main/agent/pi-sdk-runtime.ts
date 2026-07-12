@@ -52,8 +52,8 @@ import {
   listSubagentSessions,
   updateAgentSessionMetadata,
   updateAgentSessionStatus,
+  updateAgentSessionSubagentWorktree,
   updateAgentSessionTitle,
-  updateAgentSessionWorktree,
 } from "./agent-store";
 import { createCheckpoint } from "./checkpoint-service";
 import {
@@ -507,6 +507,7 @@ export class PiSdkRuntime implements AgentRuntime {
       ...(input.subagentTask !== undefined ? { subagentTask: input.subagentTask } : {}),
       ...(input.subagentType !== undefined ? { subagentType: input.subagentType } : {}),
       ...(input.subagentReadOnly !== undefined ? { subagentReadOnly: input.subagentReadOnly } : {}),
+      ...(input.worktree !== undefined ? { worktree: input.worktree } : {}),
       ...(input.subagentWorktree !== undefined ? { subagentWorktree: input.subagentWorktree } : {}),
     };
     if (modelId !== undefined) {
@@ -1118,7 +1119,7 @@ export class PiSdkRuntime implements AgentRuntime {
           return;
         }
         const updated = await finishSubagentWorktree(session.subagentWorktree, input.task);
-        updateAgentSessionWorktree(session.id, updated);
+        updateAgentSessionSubagentWorktree(session.id, updated);
         if (!runFailed) {
           emit({
             type: "subagent.updated",
